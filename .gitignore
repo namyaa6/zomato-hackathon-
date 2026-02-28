@@ -1,0 +1,3 @@
+data/training_features.csv
+__pycache__/
+*.pyc

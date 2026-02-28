@@ -159,6 +159,64 @@ def build_static_feature_tables(
 # ---------------------------------------------------------------------------
 
 
+COMBO_COMPONENT_CAT_MAP: Dict[str, str] = {
+    "curry": "main", "rice": "rice", "biryani": "rice",
+    "fried_rice": "rice", "pulao": "rice",
+    "naan": "bread", "roti": "bread", "paratha": "bread",
+    "bread": "bread", "roomali": "bread",
+    "salad": "side", "accompaniment": "side",
+    "salan": "side", "raita": "side",
+    "samosa": "appetizer", "spring_roll": "appetizer",
+    "tikki": "appetizer", "kebab": "appetizer",
+    "chaat": "side", "pav_bhaji": "main",
+    "soup": "soup", "manchurian": "main",
+    "noodles": "main", "dosa": "main",
+    "idli": "main", "vada": "appetizer",
+    "pizza": "main", "pasta": "main",
+    "indian_sweet": "dessert", "western_dessert": "dessert",
+    "cake": "dessert", "brownie": "dessert",
+    "mousse": "dessert", "pastry": "dessert",
+    "soft_drink": "beverage", "coffee": "beverage",
+    "tea": "beverage", "juice": "beverage",
+    "soda": "beverage", "lassi": "beverage",
+}
+
+
+def _expand_combo_components(
+    menu_idx: pd.DataFrame, item_ids: List[str]
+) -> Tuple[List[str], List[str]]:
+    """Return effective (categories, subcategories) with combos decomposed."""
+    eff_cats: List[str] = []
+    eff_subcats: List[str] = []
+    for iid in item_ids:
+        row = menu_idx.loc[iid]
+        if row["category"] == "combo" and row.get("combo_components"):
+            try:
+                components = json.loads(row["combo_components"]) if isinstance(
+                    row["combo_components"], str
+                ) else (row["combo_components"] or [])
+            except Exception:
+                components = []
+            if components:
+                for comp_sub in components:
+                    eff_subcats.append(comp_sub)
+                    eff_cats.append(COMBO_COMPONENT_CAT_MAP.get(comp_sub, "side"))
+                continue
+        eff_cats.append(row["category"])
+        eff_subcats.append(row["subcategory"])
+    return eff_cats, eff_subcats
+
+
+def _load_item_embeddings(
+    emb_path: str | Path = DATA_DIR / "item_embeddings.npz",
+) -> Dict[str, np.ndarray]:
+    """Load pre-computed 384-d sentence-transformer embeddings keyed by item_id."""
+    data = np.load(str(emb_path), allow_pickle=True)
+    ids = data["item_ids"]
+    vecs = data["embeddings"]
+    return {str(iid): vecs[i] for i, iid in enumerate(ids)}
+
+
 MAIN_CATS = {"main", "combo"}
 CARB_SUBCATS = {
     "rice",
@@ -391,6 +449,59 @@ def _seasonal_weight_bucket(ts: datetime) -> str:
     return "neutral"
 
 
+COLD_DESSERT_SUBCATS = {"ice_cream", "falooda", "mousse", "kulfi"}
+WARM_DESSERT_SUBCATS = {"indian_sweet", "cake", "brownie"}
+
+COLD_BEV_SUBCATS = {"soft_drink", "lassi", "juice", "mocktail", "soda"}
+WARM_BEV_SUBCATS = {"coffee", "tea"}
+
+
+def _seasonal_adjustment_features(
+    ts: datetime, candidate_row: pd.Series
+) -> Dict[str, float]:
+    """Numeric seasonal preference weights for beverage and dessert candidates.
+
+    Summer months boost cold drinks / cold desserts.
+    Winter months boost hot beverages / warm desserts.
+    Returns a candidate-specific boost in [-0.3, +0.3] and component weights.
+    """
+    m = ts.month
+    cand_cat = candidate_row["category"]
+    cand_sub = candidate_row["subcategory"]
+
+    if m in {3, 4, 5, 6}:
+        bev_weight, dessert_weight = 1.3, 1.2
+    elif m in {11, 12, 1, 2}:
+        bev_weight, dessert_weight = 0.8, 1.1
+    else:
+        bev_weight, dessert_weight = 1.0, 1.0
+
+    boost = 0.0
+    if cand_cat == "beverage" or cand_sub in BEV_SUBCATS:
+        if m in {3, 4, 5, 6} and cand_sub in COLD_BEV_SUBCATS:
+            boost = 0.3
+        elif m in {11, 12, 1, 2} and cand_sub in WARM_BEV_SUBCATS:
+            boost = 0.3
+        elif m in {11, 12, 1, 2} and cand_sub in COLD_BEV_SUBCATS:
+            boost = -0.2
+        elif m in {3, 4, 5, 6} and cand_sub in WARM_BEV_SUBCATS:
+            boost = -0.1
+
+    if cand_cat == "dessert" or cand_sub in DESSERT_SUBCATS:
+        if m in {3, 4, 5, 6} and cand_sub in COLD_DESSERT_SUBCATS:
+            boost = max(boost, 0.3)
+        elif m in {11, 12, 1, 2} and cand_sub in WARM_DESSERT_SUBCATS:
+            boost = max(boost, 0.2)
+        elif m in {11, 12, 1, 2} and cand_sub in COLD_DESSERT_SUBCATS:
+            boost = min(boost, -0.2)
+
+    return {
+        "seasonal_bev_weight": bev_weight,
+        "seasonal_dessert_weight": dessert_weight,
+        "seasonal_candidate_boost": boost,
+    }
+
+
 def _abandonment_risk_score(
     snapshot: CartSnapshot,
     time_since_last_add: float,
@@ -435,7 +546,9 @@ def assemble_features(
     users_csv: str | Path = DATA_DIR / "users.csv",
     sessions_csv: str | Path = DATA_DIR / "sessions.csv",
     cart_events_csv: str | Path = DATA_DIR / "cart_events.csv",
+    embeddings_path: str | Path = DATA_DIR / "item_embeddings.npz",
     output_path: str | Path = OUTPUT_PATH,
+    neg_sample_rate: float = 0.5,
 ) -> pd.DataFrame:
     """End-to-end feature assembly for Step 4.
 
@@ -446,6 +559,10 @@ def assemble_features(
     users = pd.read_csv(users_csv)
     sessions = pd.read_csv(sessions_csv)
     cart_events = pd.read_csv(cart_events_csv)
+
+    emb_lookup = _load_item_embeddings(embeddings_path)
+    emb_dim = next(iter(emb_lookup.values())).shape[0] if emb_lookup else 384
+    zero_emb = np.zeros(emb_dim, dtype=np.float32)
 
     # Attach restaurant_id to cart_events via sessions (needed for rest-level stats)
     if "restaurant_id" not in cart_events.columns:
@@ -471,7 +588,17 @@ def assemble_features(
 
     # Consider only recommendation impressions for training
     rec_events = cart_events[cart_events["was_recommendation"] == True].copy()  # noqa: E712
+
+    # Stratified downsample: keep all positives, sample neg_sample_rate of negatives
+    total_before = len(rec_events)
+    positives = rec_events[rec_events["was_accepted"] == True]  # noqa: E712
+    negatives = rec_events[rec_events["was_accepted"] != True]  # noqa: E712
+    neg_sampled = negatives.sample(frac=neg_sample_rate, random_state=42)
+    rec_events = pd.concat([positives, neg_sampled], ignore_index=True)
     rec_events = rec_events.sort_values(["session_id", "timestamp"]).reset_index(drop=True)
+    print(f"[Step 4] Downsampled: {total_before} -> {len(rec_events)} "
+          f"(kept all {len(positives)} positives, "
+          f"sampled {len(neg_sampled)}/{len(negatives)} negatives at {neg_sample_rate:.0%})")
 
     # For cart reconstruction we need per-session ordered events
     events_by_session: Dict[str, pd.DataFrame] = {
@@ -480,9 +607,13 @@ def assemble_features(
     }
 
     feature_rows: List[Dict[str, object]] = []
+    n_total = len(rec_events)
+    report_every = max(1, n_total // 10)
 
     # Iterate over each recommendation impression
-    for _, evt in rec_events.iterrows():
+    for row_idx, (_, evt) in enumerate(rec_events.iterrows()):
+        if row_idx % report_every == 0:
+            print(f"  Processing {row_idx}/{n_total} ({100*row_idx/n_total:.0f}%)", flush=True)
         session_id = evt["session_id"]
         item_id = evt["item_id"]
         ts: datetime = evt["timestamp"]
@@ -512,13 +643,15 @@ def assemble_features(
         else:
             item_ids_in_cart = in_cart["item_id"].tolist()
             menu_rows = menu_idx.loc[item_ids_in_cart]
+
+            eff_cats, eff_subcats = _expand_combo_components(menu_idx, item_ids_in_cart)
+
             snapshot = CartSnapshot(
                 item_ids=item_ids_in_cart,
-                categories=menu_rows["category"].tolist(),
-                subcategories=menu_rows["subcategory"].tolist(),
+                categories=eff_cats,
+                subcategories=eff_subcats,
                 prices=menu_rows["price"].astype(float).tolist(),
             )
-            # First cart item is simply the first organic or accepted event
             first_evt = in_cart.iloc[0]
             first_item_price = float(menu_idx.loc[first_evt["item_id"], "price"])
             first_price = first_item_price
@@ -556,6 +689,7 @@ def assemble_features(
         # Peak hour / seasonal
         peak_mode = _peak_hour_mode(ts)
         season_bucket = _seasonal_weight_bucket(ts)
+        seasonal_feat = _seasonal_adjustment_features(ts, item_row)
 
         # Profile veg days signal (hard veg day equivalent to toggle)
         veg_days = json.loads(user_row["veg_days"])
@@ -603,6 +737,11 @@ def assemble_features(
                 continue
             row[f"rest_{col}"] = rest_row[col]
 
+        # Semantic embedding for candidate item
+        cand_emb = emb_lookup.get(str(item_id), zero_emb)
+        for d in range(emb_dim):
+            row[f"item_emb_{d}"] = float(cand_emb[d])
+
         # Dynamic features
         row.update(
             {
@@ -621,6 +760,7 @@ def assemble_features(
         row.update(gap_feat)
         row.update(price_anchor)
         row.update(dtd_feat)
+        row.update(seasonal_feat)
 
         feature_rows.append(row)
 
